@@ -6,6 +6,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from tqdm import tqdm
 
 from .decoder import ConditionalDecoder
@@ -183,7 +184,6 @@ class CausalConditionalCFM(nn.Module):
                 t=t.to(self.dtype),
                 spks=spks.to(self.dtype),
                 cond=cond.to(self.dtype),
-                r=r.to(self.dtype),
             )
 
             dt = r - t

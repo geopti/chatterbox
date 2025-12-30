@@ -16,19 +16,13 @@ import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 
-import sys
-# Add src to path to import original S3Gen (architecture matches checkpoint)
-_src_path = str(Path(__file__).parent.parent / "src")
-if _src_path not in sys.path:
-    sys.path.insert(0, _src_path)
-
 from .t3 import T3
 from .t3.config import T3Config
 from .t3.conditioning import T3Cond
-# Use original S3Gen since architecture matches checkpoint exactly
-from chatterbox.models.s3gen import S3Gen
-from chatterbox.models.s3tokenizer import S3_SR, drop_invalid_tokens, SPEECH_VOCAB_SIZE, S3Tokenizer
-from chatterbox.models.s3gen import S3GEN_SR
+# Use pure PyTorch S3Gen implementation
+from .s3gen.model import S3Gen
+from .s3gen.s3tokenizer import S3_SR, drop_invalid_tokens, SPEECH_VOCAB_SIZE, S3Tokenizer
+from .s3gen.mel import S3GEN_SR
 from .voice_encoder import VoiceEncoder
 from .tokenizers import EnTokenizer
 

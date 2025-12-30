@@ -202,7 +202,11 @@ class SourceModule(nn.Module):
 
 class ConvRNNF0Predictor(nn.Module):
     """
-    F0 predictor using Conv + RNN.
+    F0 predictor using Conv network.
+
+    Matches checkpoint structure:
+        - condnet: Sequential with Conv1d at indices 0,2,4,6,8 (ELU between)
+        - classifier: Final Linear layer
 
     Predicts fundamental frequency from mel-spectrogram.
     """
@@ -217,16 +221,18 @@ class ConvRNNF0Predictor(nn.Module):
     ):
         super().__init__()
 
-        self.convs = nn.ModuleList()
-        self.convs.append(
-            nn.Conv1d(in_channels, hidden_channels, kernel_size, padding=kernel_size // 2)
-        )
-        for _ in range(num_layers - 1):
-            self.convs.append(
-                nn.Conv1d(hidden_channels, hidden_channels, kernel_size, padding=kernel_size // 2)
+        # Build condnet as Sequential (indices 0,2,4,6,8 are Conv, 1,3,5,7 are ELU)
+        layers = []
+        for i in range(num_layers):
+            in_ch = in_channels if i == 0 else hidden_channels
+            layers.append(
+                weight_norm(nn.Conv1d(in_ch, hidden_channels, kernel_size, padding=kernel_size // 2))
             )
+            if i < num_layers - 1:
+                layers.append(nn.ELU())
 
-        self.fc = nn.Linear(hidden_channels, out_channels)
+        self.condnet = nn.Sequential(*layers)
+        self.classifier = nn.Linear(hidden_channels, out_channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -238,12 +244,13 @@ class ConvRNNF0Predictor(nn.Module):
         Returns:
             F0 of shape (batch, 1, time)
         """
-        for conv in self.convs:
-            x = F.elu(conv(x))
+        # Apply condnet
+        x = self.condnet(x)
+        x = F.elu(x)  # Final activation
 
-        # Global average pooling per frame
+        # Per-frame prediction
         x = x.transpose(1, 2)
-        x = self.fc(x)
+        x = self.classifier(x)
         x = x.transpose(1, 2)
 
         # Ensure positive F0

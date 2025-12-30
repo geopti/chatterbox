@@ -96,7 +96,9 @@ class CausalMaskedDiffWithXvec(nn.Module):
 
         # Encoder output projection
         if encoder is not None:
-            self.encoder_proj = nn.Linear(encoder.output_size, output_size)
+            # Handle both method and property style output_size
+            enc_out_size = encoder.output_size() if callable(encoder.output_size) else encoder.output_size
+            self.encoder_proj = nn.Linear(enc_out_size, output_size)
         else:
             self.encoder_proj = nn.Linear(input_size, output_size)
 
@@ -171,9 +173,8 @@ class CausalMaskedDiffWithXvec(nn.Module):
         if not finalize:
             h = h[:, :-self.pre_lookahead_len * self.token_mel_ratio]
 
-        h_lengths = h_masks.sum(dim=-1).squeeze(dim=-1)
-        if h_lengths.ndim == 0:
-            h_lengths = h_lengths.unsqueeze(0)  # Ensure at least 1D
+        # h_masks is (batch, 1, time), sum across time dim to get lengths
+        h_lengths = h_masks.sum(dim=-1).squeeze(dim=-1)  # (batch,)
         mel_len1 = prompt_feat.shape[1]
         mel_len2 = h.shape[1] - mel_len1
         h = self.encoder_proj(h)

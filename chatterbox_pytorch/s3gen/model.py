@@ -69,7 +69,7 @@ class S3Token2Mel(nn.Module):
             attention_dropout_rate=0.1,
         )
 
-        # Build CFM decoder
+        # Build CFM decoder using original architecture
         estimator = ConditionalDecoder(
             in_channels=320,
             out_channels=80,
@@ -81,16 +81,13 @@ class S3Token2Mel(nn.Module):
             num_mid_blocks=12,
             num_heads=8,
             act_fn="gelu",
-            meanflow=self.meanflow,
         )
 
         decoder = CausalConditionalCFM(
+            in_channels=240,
+            n_spks=1,
             spk_emb_dim=80,
             estimator=estimator,
-            sigma_min=1e-6,
-            t_scheduler="cosine",
-            training_cfg_rate=0.2,
-            inference_cfg_rate=0.7,
         )
 
         # Flow module
