@@ -15,7 +15,7 @@ import torch.nn as nn
 
 def download_weights(repo_id: str = "ResembleAI/chatterbox") -> Path:
     """
-    Download weights from HuggingFace Hub.
+    Download weights from HuggingFace Hub (English-only model).
 
     Args:
         repo_id: HuggingFace repository ID
@@ -30,6 +30,33 @@ def download_weights(repo_id: str = "ResembleAI/chatterbox") -> Path:
         "t3_cfg.safetensors",
         "s3gen.safetensors",
         "tokenizer.json",
+        "conds.pt",
+    ]
+
+    local_path = None
+    for fname in files:
+        local_path = hf_hub_download(repo_id=repo_id, filename=fname)
+
+    return Path(local_path).parent
+
+
+def download_multilingual_weights(repo_id: str = "ResembleAI/chatterbox") -> Path:
+    """
+    Download weights from HuggingFace Hub (multilingual model).
+
+    Args:
+        repo_id: HuggingFace repository ID
+
+    Returns:
+        Path to the downloaded checkpoint directory
+    """
+    from huggingface_hub import hf_hub_download
+
+    files = [
+        "ve.safetensors",
+        "t3_mtl23ls_v2.safetensors",
+        "s3gen.safetensors",
+        "grapheme_mtl_merged_expanded_v1.json",
         "conds.pt",
     ]
 
