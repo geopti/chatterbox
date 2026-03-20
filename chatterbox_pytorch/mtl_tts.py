@@ -335,6 +335,7 @@ class ChatterboxMultilingualTTS:
                 repetition_penalty=repetition_penalty,
                 min_p=min_p,
                 top_p=top_p,
+                use_alignment_analyzer=True,
             )
 
             # Take conditional batch

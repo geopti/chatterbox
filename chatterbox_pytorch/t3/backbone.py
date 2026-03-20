@@ -140,6 +140,9 @@ class LLaMAAttention(nn.Module):
 
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).type_as(q)
 
+        # Store for AlignmentStreamAnalyzer (read after forward pass, no hooks needed)
+        self._last_attn_weights = attn_weights
+
         if self.training and self.attention_dropout > 0:
             attn_weights = F.dropout(attn_weights, p=self.attention_dropout)
 

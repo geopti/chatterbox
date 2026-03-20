@@ -237,6 +237,7 @@ class T3(nn.Module):
         min_p: float = 0.05,
         repetition_penalty: float = 1.2,
         cfg_weight: float = 0.5,
+        use_alignment_analyzer: bool = False,
     ) -> Tensor:
         """
         Generate speech tokens autoregressively.
@@ -304,6 +305,18 @@ class T3(nn.Module):
             use_cache=True,
         )
 
+        # Create alignment analyzer for hallucination detection
+        analyzer = None
+        if use_alignment_analyzer:
+            from .alignment import AlignmentStreamAnalyzer
+            text_len = text_tokens.shape[1]
+            text_tokens_slice = (cond_len, cond_len + text_len)
+            analyzer = AlignmentStreamAnalyzer(
+                self.backbone,
+                text_tokens_slice=text_tokens_slice,
+                eos_idx=self.config.stop_speech_token,
+            )
+
         # Generation loop
         for step in tqdm(range(max_new_tokens), desc="Generating"):
             # Get logits from last position
@@ -316,6 +329,11 @@ class T3(nn.Module):
                 logits = cond_logits + cfg_weight * (cond_logits - uncond_logits)
             else:
                 logits = logits[0:1]
+
+            # Alignment analysis (hallucination detection)
+            if analyzer is not None:
+                last_token = generated_tokens[-1].item() if generated_tokens else None
+                logits = analyzer.step(logits, next_token=last_token)
 
             # Process logits
             input_ids = torch.cat(generated_tokens, dim=1)
