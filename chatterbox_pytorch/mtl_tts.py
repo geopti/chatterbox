@@ -6,8 +6,9 @@ for end-to-end multilingual text-to-speech synthesis with voice cloning.
 Supports 23 languages.
 """
 
+import re
 from pathlib import Path
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 import librosa
 import torch
@@ -344,6 +345,13 @@ class ChatterboxMultilingualTTS:
             speech_tokens = speech_tokens[speech_tokens < SPEECH_VOCAB_SIZE]
             speech_tokens = speech_tokens.to(self.device)
 
+            # Check minimum token count to avoid vocoder crash
+            if len(speech_tokens) < 3:
+                raise RuntimeError(
+                    "T3 generated too few speech tokens. "
+                    "Try shorter text or use generate_long() for multiple sentences."
+                )
+
             # Generate waveform
             wav, _ = self.s3gen.inference(
                 speech_tokens=speech_tokens,
@@ -353,3 +361,111 @@ class ChatterboxMultilingualTTS:
             wav = wav.squeeze(0).detach().cpu().numpy()
 
         return torch.from_numpy(wav).unsqueeze(0)
+
+    def generate_long(
+        self,
+        text: str,
+        language_id: str,
+        audio_prompt_path: Optional[str] = None,
+        exaggeration: float = 0.5,
+        cfg_weight: float = 0.5,
+        temperature: float = 0.8,
+        repetition_penalty: float = 2.0,
+        min_p: float = 0.05,
+        top_p: float = 1.0,
+        pause_duration: float = 0.3,
+        max_words: int = 60,
+    ) -> torch.Tensor:
+        """
+        Generate speech from long text by splitting into sentences.
+
+        Each sentence is generated separately and concatenated with pauses.
+
+        Args:
+            text: Input text (can be multiple sentences)
+            language_id: Language code (e.g., "en", "fr", "ja")
+            audio_prompt_path: Path to reference audio for voice cloning
+            exaggeration: Emotion exaggeration factor
+            cfg_weight: Classifier-free guidance weight
+            temperature: Sampling temperature
+            repetition_penalty: Token repetition penalty
+            min_p: Min-p sampling parameter
+            top_p: Top-p (nucleus) sampling parameter
+            pause_duration: Silence between sentences in seconds
+            max_words: Max words per chunk
+
+        Returns:
+            Generated audio waveform (tensor of shape [1, samples])
+        """
+        sentences = self._split_sentences(text, max_words=max_words)
+
+        if len(sentences) == 0:
+            raise ValueError("No sentences found in text")
+
+        if len(sentences) == 1:
+            return self.generate(
+                sentences[0], language_id,
+                audio_prompt_path=audio_prompt_path,
+                exaggeration=exaggeration, cfg_weight=cfg_weight,
+                temperature=temperature, repetition_penalty=repetition_penalty,
+                min_p=min_p, top_p=top_p,
+            )
+
+        # Prepare conditionals once
+        if audio_prompt_path:
+            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+
+        pause_samples = int(pause_duration * self.sr)
+        pause = torch.zeros(1, pause_samples)
+
+        chunks = []
+        for i, sentence in enumerate(sentences):
+            print(f"Generating sentence {i + 1}/{len(sentences)}: {sentence[:60]}...")
+            try:
+                wav = self.generate(
+                    sentence, language_id,
+                    exaggeration=exaggeration, cfg_weight=cfg_weight,
+                    temperature=temperature, repetition_penalty=repetition_penalty,
+                    min_p=min_p, top_p=top_p,
+                )
+                chunks.append(wav)
+                if i < len(sentences) - 1:
+                    chunks.append(pause)
+            except RuntimeError as e:
+                print(f"Warning: skipping sentence {i + 1} ({e})")
+                continue
+
+        if not chunks:
+            raise RuntimeError("Failed to generate any audio chunks")
+
+        return torch.cat(chunks, dim=1)
+
+    @staticmethod
+    def _split_sentences(text: str, max_words: int = 60) -> List[str]:
+        """Split text into chunks of up to max_words by grouping consecutive sentences."""
+        # Split on standard and CJK sentence enders
+        parts = re.split(r'(?<=[.!?\u3002\uff01\uff1f])\s*', text)
+        sentences = [s.strip() for s in parts if s.strip()]
+
+        if not sentences:
+            return [text.strip()] if text.strip() else []
+
+        # Group sentences into chunks that don't exceed max_words
+        chunks = []
+        current_chunk = []
+        current_words = 0
+
+        for sentence in sentences:
+            word_count = len(sentence.split())
+            if current_chunk and current_words + word_count > max_words:
+                chunks.append(" ".join(current_chunk))
+                current_chunk = [sentence]
+                current_words = word_count
+            else:
+                current_chunk.append(sentence)
+                current_words += word_count
+
+        if current_chunk:
+            chunks.append(" ".join(current_chunk))
+
+        return chunks

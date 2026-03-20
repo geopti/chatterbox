@@ -46,6 +46,12 @@ def main():
                         help="Token repetition penalty (default: 2.0)")
     parser.add_argument("--top_p", type=float, default=1.0,
                         help="Top-p (nucleus) sampling parameter (default: 1.0)")
+    parser.add_argument("--long", action="store_true",
+                        help="Split text into sentences and generate each separately (for longer texts)")
+    parser.add_argument("--pause", type=float, default=0.3,
+                        help="Pause duration between sentences in seconds when using --long (default: 0.3)")
+    parser.add_argument("--max-words", type=int, default=60,
+                        help="Max words per chunk when using --long (default: 60)")
 
     args = parser.parse_args()
 
@@ -86,28 +92,23 @@ def main():
     print()
 
     # Generate speech
-    print("Generating speech...")
+    gen_func = tts.generate_long if args.long else tts.generate
+    gen_kwargs = dict(
+        language_id=args.language,
+        cfg_weight=args.cfg,
+        exaggeration=args.exaggeration,
+        temperature=args.temperature,
+        repetition_penalty=args.repetition_penalty,
+        top_p=args.top_p,
+    )
     if args.ref:
-        wav = tts.generate(
-            args.text,
-            language_id=args.language,
-            audio_prompt_path=args.ref,
-            cfg_weight=args.cfg,
-            exaggeration=args.exaggeration,
-            temperature=args.temperature,
-            repetition_penalty=args.repetition_penalty,
-            top_p=args.top_p,
-        )
-    else:
-        wav = tts.generate(
-            args.text,
-            language_id=args.language,
-            cfg_weight=args.cfg,
-            exaggeration=args.exaggeration,
-            temperature=args.temperature,
-            repetition_penalty=args.repetition_penalty,
-            top_p=args.top_p,
-        )
+        gen_kwargs["audio_prompt_path"] = args.ref
+    if args.long:
+        gen_kwargs["pause_duration"] = args.pause
+        gen_kwargs["max_words"] = args.max_words
+
+    print("Generating speech..." + (" (long mode)" if args.long else ""))
+    wav = gen_func(args.text, **gen_kwargs)
 
     # Convert to int16 for wav file
     wav_data = wav.squeeze().cpu().numpy()
