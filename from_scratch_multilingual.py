@@ -52,6 +52,10 @@ def main():
                         help="Pause duration between sentences in seconds when using --long (default: 0.3)")
     parser.add_argument("--max-words", type=int, default=60,
                         help="Max words per chunk when using --long (default: 60)")
+    parser.add_argument("--token-repeat", type=int, default=3,
+                        help="Consecutive identical tokens to trigger forced EOS (default: 3)")
+    parser.add_argument("--trim-buffer", type=int, default=25,
+                        help="Frames to keep after text completion when trimming garbage tail (default: 25, ~1s)")
 
     args = parser.parse_args()
 
@@ -100,6 +104,8 @@ def main():
         temperature=args.temperature,
         repetition_penalty=args.repetition_penalty,
         top_p=args.top_p,
+        token_repetition_threshold=args.token_repeat,
+        trim_buffer=args.trim_buffer,
     )
     if args.ref:
         gen_kwargs["audio_prompt_path"] = args.ref

@@ -267,6 +267,8 @@ class ChatterboxMultilingualTTS:
         repetition_penalty: float = 2.0,
         min_p: float = 0.05,
         top_p: float = 1.0,
+        token_repetition_threshold: int = 3,
+        trim_buffer: int = 25,
     ) -> torch.Tensor:
         """
         Generate speech from text in the specified language.
@@ -281,6 +283,8 @@ class ChatterboxMultilingualTTS:
             repetition_penalty: Token repetition penalty
             min_p: Min-p sampling parameter
             top_p: Top-p (nucleus) sampling parameter
+            token_repetition_threshold: Consecutive identical tokens to trigger forced EOS
+            trim_buffer: Frames to keep after text completion when trimming garbage tail
 
         Returns:
             Generated audio waveform (tensor of shape [1, samples])
@@ -336,6 +340,8 @@ class ChatterboxMultilingualTTS:
                 min_p=min_p,
                 top_p=top_p,
                 use_alignment_analyzer=True,
+                token_repetition_threshold=token_repetition_threshold,
+                trim_buffer=trim_buffer,
             )
 
             # Take conditional batch
@@ -352,6 +358,10 @@ class ChatterboxMultilingualTTS:
                     "T3 generated too few speech tokens. "
                     "Try shorter text or use generate_long() for multiple sentences."
                 )
+
+            # Track alignment analyzer state for retry logic
+            self._last_forced_eos = getattr(self.t3, '_last_forced_eos', False)
+            self._last_text_complete = getattr(self.t3, '_last_text_complete', True)
 
             # Generate waveform
             wav, _ = self.s3gen.inference(
@@ -376,6 +386,8 @@ class ChatterboxMultilingualTTS:
         top_p: float = 1.0,
         pause_duration: float = 0.3,
         max_words: int = 60,
+        token_repetition_threshold: int = 3,
+        trim_buffer: int = 25,
     ) -> torch.Tensor:
         """
         Generate speech from long text by splitting into sentences.
@@ -410,6 +422,8 @@ class ChatterboxMultilingualTTS:
                 exaggeration=exaggeration, cfg_weight=cfg_weight,
                 temperature=temperature, repetition_penalty=repetition_penalty,
                 min_p=min_p, top_p=top_p,
+                token_repetition_threshold=token_repetition_threshold,
+                trim_buffer=trim_buffer,
             )
 
         # Prepare conditionals once
@@ -419,22 +433,37 @@ class ChatterboxMultilingualTTS:
         pause_samples = int(pause_duration * self.sr)
         pause = torch.zeros(1, pause_samples)
 
+        max_retries = 2
         chunks = []
         for i, sentence in enumerate(sentences):
             print(f"Generating sentence {i + 1}/{len(sentences)}: {sentence[:60]}...")
-            try:
-                wav = self.generate(
-                    sentence, language_id,
-                    exaggeration=exaggeration, cfg_weight=cfg_weight,
-                    temperature=temperature, repetition_penalty=repetition_penalty,
-                    min_p=min_p, top_p=top_p,
-                )
+            wav = None
+            for attempt in range(1 + max_retries):
+                try:
+                    wav = self.generate(
+                        sentence, language_id,
+                        exaggeration=exaggeration, cfg_weight=cfg_weight,
+                        temperature=temperature, repetition_penalty=repetition_penalty,
+                        min_p=min_p, top_p=top_p,
+                        token_repetition_threshold=token_repetition_threshold,
+                        trim_buffer=trim_buffer,
+                    )
+                    # Retry only if forced EOS cut the sentence short (text not fully spoken)
+                    if self._last_forced_eos and not self._last_text_complete and attempt < max_retries:
+                        print(f"  Sentence cut short by forced EOS, retrying sentence {i + 1} (attempt {attempt + 2}/{1 + max_retries})...")
+                        continue
+                    break
+                except RuntimeError as e:
+                    if attempt < max_retries:
+                        print(f"  Error, retrying sentence {i + 1} (attempt {attempt + 2}/{1 + max_retries}): {e}")
+                        continue
+                    print(f"Warning: skipping sentence {i + 1} ({e})")
+                    break
+
+            if wav is not None:
                 chunks.append(wav)
                 if i < len(sentences) - 1:
                     chunks.append(pause)
-            except RuntimeError as e:
-                print(f"Warning: skipping sentence {i + 1} ({e})")
-                continue
 
         if not chunks:
             raise RuntimeError("Failed to generate any audio chunks")

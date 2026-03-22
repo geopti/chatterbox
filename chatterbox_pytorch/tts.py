@@ -411,22 +411,31 @@ class ChatterboxTTS:
         pause_samples = int(pause_duration * self.sr)
         pause = torch.zeros(1, pause_samples)
 
+        max_retries = 2
         chunks = []
         for i, sentence in enumerate(sentences):
             print(f"Generating sentence {i + 1}/{len(sentences)}: {sentence[:60]}...")
-            try:
-                wav = self.generate(
-                    sentence,
-                    exaggeration=exaggeration, cfg_weight=cfg_weight,
-                    temperature=temperature, repetition_penalty=repetition_penalty,
-                    min_p=min_p, top_p=top_p,
-                )
+            wav = None
+            for attempt in range(1 + max_retries):
+                try:
+                    wav = self.generate(
+                        sentence,
+                        exaggeration=exaggeration, cfg_weight=cfg_weight,
+                        temperature=temperature, repetition_penalty=repetition_penalty,
+                        min_p=min_p, top_p=top_p,
+                    )
+                    break
+                except RuntimeError as e:
+                    if attempt < max_retries:
+                        print(f"  Error, retrying sentence {i + 1} (attempt {attempt + 2}/{1 + max_retries}): {e}")
+                        continue
+                    print(f"Warning: skipping sentence {i + 1} ({e})")
+                    break
+
+            if wav is not None:
                 chunks.append(wav)
                 if i < len(sentences) - 1:
                     chunks.append(pause)
-            except RuntimeError as e:
-                print(f"Warning: skipping sentence {i + 1} ({e})")
-                continue
 
         if not chunks:
             raise RuntimeError("Failed to generate any audio chunks")

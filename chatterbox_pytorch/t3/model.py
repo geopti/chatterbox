@@ -4,6 +4,7 @@ T3 (Token-to-Token) TTS model.
 Main model that converts text tokens to speech tokens.
 """
 
+import logging
 from typing import List, Optional, Tuple
 
 import torch
@@ -16,6 +17,8 @@ from .config import T3Config
 from .backbone import LLaMABackbone
 from .conditioning import T3Cond, T3CondEnc
 from .sampling import process_logits, sample_token
+
+logger = logging.getLogger(__name__)
 
 
 class LearnedPositionEmbeddings(nn.Module):
@@ -238,6 +241,8 @@ class T3(nn.Module):
         repetition_penalty: float = 1.2,
         cfg_weight: float = 0.5,
         use_alignment_analyzer: bool = False,
+        token_repetition_threshold: int = 3,
+        trim_buffer: int = 25,
     ) -> Tensor:
         """
         Generate speech tokens autoregressively.
@@ -315,6 +320,8 @@ class T3(nn.Module):
                 self.backbone,
                 text_tokens_slice=text_tokens_slice,
                 eos_idx=self.config.stop_speech_token,
+                token_repetition_threshold=token_repetition_threshold,
+                trim_buffer=trim_buffer,
             )
 
         # Generation loop
@@ -372,6 +379,24 @@ class T3(nn.Module):
 
         # Concatenate all generated tokens
         all_tokens = torch.cat(generated_tokens, dim=1)
+
+        # Trim garbage tail if alignment analyzer detected long_tail/alignment_repetition
+        # trim_to is in frame positions; +1 accounts for the initial SOS token
+        if analyzer is not None and analyzer.trim_to is not None:
+            trim_len = analyzer.trim_to + 1
+            if trim_len < all_tokens.shape[1]:
+                logger.info(f"Trimming speech tokens from {all_tokens.shape[1]} to {trim_len}")
+                all_tokens = all_tokens[:, :trim_len]
+
+        # Store alignment analyzer state (for retry logic)
+        # forced_eos: analyzer forced early stop
+        # text_complete: text was fully spoken before forced EOS
+        if analyzer is not None:
+            self._last_forced_eos = analyzer.forced_eos
+            self._last_text_complete = analyzer.complete
+        else:
+            self._last_forced_eos = False
+            self._last_text_complete = True
 
         return all_tokens
 

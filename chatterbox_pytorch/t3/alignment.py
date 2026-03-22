@@ -33,16 +33,19 @@ class AlignmentStreamAnalyzer:
     (stored by LLaMAAttention.forward()). No hooks needed.
     """
 
-    def __init__(self, backbone, text_tokens_slice, eos_idx):
+    def __init__(self, backbone, text_tokens_slice, eos_idx, token_repetition_threshold=3, trim_buffer=25):
         """
         Args:
             backbone: LLaMABackbone instance (to read _last_attn_weights from layers)
             text_tokens_slice: Tuple (start, end) of text token positions in the sequence
             eos_idx: Token ID for end-of-speech (stop_speech_token)
+            token_repetition_threshold: Number of consecutive identical tokens to trigger forced EOS (default: 3)
         """
         self.backbone = backbone
         self.text_tokens_slice = (i, j) = text_tokens_slice
         self.eos_idx = eos_idx
+        self.token_repetition_threshold = token_repetition_threshold
+        self.trim_buffer = trim_buffer
 
         self.alignment = torch.zeros(0, j - i)
         self.curr_frame_pos = 0
@@ -55,6 +58,8 @@ class AlignmentStreamAnalyzer:
         self.completed_at = None
 
         self.generated_tokens = []
+        self.forced_eos = False
+        self.trim_to = None  # If set, trim generated tokens to this length
 
     def _read_aligned_attentions(self):
         """Read attention weights from the 3 aligned heads directly from backbone layers."""
@@ -133,14 +138,15 @@ class AlignmentStreamAnalyzer:
             if len(self.generated_tokens) > 8:
                 self.generated_tokens = self.generated_tokens[-8:]
 
-        # Token repetition: last 2 tokens identical
+        # Token repetition: last N tokens identical
+        N = self.token_repetition_threshold
         token_repetition = (
-            len(self.generated_tokens) >= 3
-            and len(set(self.generated_tokens[-2:])) == 1
+            len(self.generated_tokens) >= N
+            and len(set(self.generated_tokens[-N:])) == 1
         )
 
         if token_repetition:
-            logger.warning(f"Detected 2x repetition of token {self.generated_tokens[-1]}")
+            logger.warning(f"Detected {N}x repetition of token {self.generated_tokens[-1]}")
 
         # Suppress EOS to prevent early termination (before text is fully spoken)
         if cur_text_posn < S - 3 and S > 5:
@@ -151,6 +157,11 @@ class AlignmentStreamAnalyzer:
             logger.warning(f"Forcing EOS: {long_tail=}, {alignment_repetition=}, {token_repetition=}")
             logits = -(2**15) * torch.ones_like(logits)
             logits[..., self.eos_idx] = 2**15
+            self.forced_eos = True
+            # For long_tail/alignment_repetition, trim back to where text was fully spoken
+            # to remove garbage tokens already generated after completion
+            if (long_tail or alignment_repetition) and self.completed_at is not None:
+                self.trim_to = self.completed_at + self.trim_buffer
 
         self.curr_frame_pos += 1
         return logits
