@@ -1,0 +1,20 @@
+build:
+  gpu: true
+  python_version: "3.12"
+  system_packages:
+    - "ffmpeg"
+    - "libsndfile1"
+  python_packages:
+    - "torch==2.6.0"
+    - "torchaudio==2.6.0"
+    - "numpy>=1.24.0,<1.26.0"
+    - "librosa==0.11.0"
+    - "scipy"
+    - "huggingface_hub"
+    - "safetensors==0.5.3"
+    - "tokenizers"
+    - "tqdm"
+  run:
+    - python -c "from huggingface_hub import hf_hub_download; [hf_hub_download(repo_id='ResembleAI/chatterbox', filename=f) for f in ['ve.safetensors','t3_mtl23ls_v2.safetensors','s3gen.safetensors','grapheme_mtl_merged_expanded_v1.json','conds.pt']]"
+predict: "predict.py:Predictor"
+image: "r8.im/geopti/chatterbox-multilingual"

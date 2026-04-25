@@ -1,0 +1,23 @@
+# Generated audio
+*.wav
+output*.wav
+
+# Working directories from prior debugging
+temp/
+test_outputs/
+llama2.c/
+patch.diff
+
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Git / IDE
+.git/
+.vscode/
+
+# Other models / images
+*.png
+*.jpg
+checkpoints/
