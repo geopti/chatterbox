@@ -312,24 +312,9 @@ class ChatterboxMultilingualTTS:
                 emotion_adv=exaggeration * torch.ones(1, 1, 1),
             ).to(device=self.device)
 
-        # Normalize and tokenize text
-        text = punc_norm(text)
-        text_tokens = self.tokenizer.text_to_tokens(
-            text, language_id=language_id.lower() if language_id else None
-        ).to(self.device)
-
-        # Duplicate for CFG
-        if cfg_weight > 0.0:
-            text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
-
-        # Add start/end tokens
-        sot = self.t3.hp.start_text_token
-        eot = self.t3.hp.stop_text_token
-        text_tokens = F.pad(text_tokens, (1, 0), value=sot)
-        text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+        text_tokens = self._prepare_text_tokens(text, language_id, cfg_weight)
 
         with torch.inference_mode():
-            # Generate speech tokens
             speech_tokens = self.t3.inference(
                 t3_cond=self.conds.t3,
                 text_tokens=text_tokens,
@@ -344,34 +329,107 @@ class ChatterboxMultilingualTTS:
                 trim_buffer=trim_buffer,
             )
 
-            # Take conditional batch
-            speech_tokens = speech_tokens[0]
-
-            # Filter invalid tokens
-            speech_tokens = drop_invalid_tokens(speech_tokens)
-            speech_tokens = speech_tokens[speech_tokens < SPEECH_VOCAB_SIZE]
-            speech_tokens = speech_tokens.to(self.device)
-
-            # Check minimum token count to avoid vocoder crash
-            if len(speech_tokens) < 3:
-                raise RuntimeError(
-                    "T3 generated too few speech tokens. "
-                    "Try shorter text or use generate_long() for multiple sentences."
-                )
-
             # Track alignment analyzer state for retry logic
             self._last_forced_eos = getattr(self.t3, '_last_forced_eos', False)
             self._last_text_complete = getattr(self.t3, '_last_text_complete', True)
 
-            # Generate waveform
-            wav, _ = self.s3gen.inference(
-                speech_tokens=speech_tokens,
-                ref_dict=self.conds.gen,
+            wav = self._speech_tokens_to_wav(speech_tokens[0])
+
+        return wav
+
+    def _prepare_text_tokens(self, text: str, language_id: str, cfg_weight: float) -> torch.Tensor:
+        """Normalize, tokenize, add start/end tokens, and duplicate for CFG."""
+        text = punc_norm(text)
+        text_tokens = self.tokenizer.text_to_tokens(
+            text, language_id=language_id.lower() if language_id else None
+        ).to(self.device)
+        if cfg_weight > 0.0:
+            text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
+        sot = self.t3.hp.start_text_token
+        eot = self.t3.hp.stop_text_token
+        text_tokens = F.pad(text_tokens, (1, 0), value=sot)
+        text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+        return text_tokens
+
+    def _speech_tokens_to_wav(self, speech_tokens: torch.Tensor) -> torch.Tensor:
+        """Convert speech tokens to waveform via S3Gen. Returns (1, samples) tensor."""
+        speech_tokens = drop_invalid_tokens(speech_tokens)
+        speech_tokens = speech_tokens[speech_tokens < SPEECH_VOCAB_SIZE]
+        speech_tokens = speech_tokens.to(self.device)
+        if len(speech_tokens) < 3:
+            raise RuntimeError(
+                "T3 generated too few speech tokens. "
+                "Try shorter text or use generate_long() for multiple sentences."
+            )
+        wav, _ = self.s3gen.inference(
+            speech_tokens=speech_tokens,
+            ref_dict=self.conds.gen,
+        )
+        wav = wav.squeeze(0).detach().cpu().numpy()
+        return torch.from_numpy(wav).unsqueeze(0)
+
+    def generate_batch(
+        self,
+        texts: List[str],
+        language_id: str,
+        exaggeration: float = 0.5,
+        cfg_weight: float = 0.5,
+        temperature: float = 0.8,
+        repetition_penalty: float = 2.0,
+        min_p: float = 0.05,
+        top_p: float = 1.0,
+        token_repetition_threshold: int = 3,
+        trim_buffer: int = 25,
+    ) -> List[Optional[torch.Tensor]]:
+        """
+        Generate speech for multiple texts in parallel on the GPU.
+
+        Args:
+            texts: List of text strings to synthesize
+            language_id: Language code
+            Other args: same as generate()
+
+        Returns:
+            List of waveform tensors (or None for failed items)
+        """
+        assert self.conds is not None, "Call prepare_conditionals first"
+
+        # Tokenize all texts
+        text_tokens_list = [
+            self._prepare_text_tokens(t, language_id, cfg_weight) for t in texts
+        ]
+
+        with torch.inference_mode():
+            # Batched T3 inference
+            speech_tokens_list = self.t3.inference_batch(
+                t3_cond=self.conds.t3,
+                text_tokens_list=text_tokens_list,
+                max_new_tokens=1000,
+                temperature=temperature,
+                cfg_weight=cfg_weight,
+                repetition_penalty=repetition_penalty,
+                min_p=min_p,
+                top_p=top_p,
+                use_alignment_analyzer=True,
+                token_repetition_threshold=token_repetition_threshold,
+                trim_buffer=trim_buffer,
             )
 
-            wav = wav.squeeze(0).detach().cpu().numpy()
+            # Store per-item forced_eos / text_complete
+            self._last_batch_forced_eos = self.t3._last_batch_forced_eos
+            self._last_batch_text_complete = self.t3._last_batch_text_complete
 
-        return torch.from_numpy(wav).unsqueeze(0)
+            # Convert each to waveform via S3Gen (sequential — it's fast)
+            results = []
+            for i, tokens in enumerate(speech_tokens_list):
+                try:
+                    wav = self._speech_tokens_to_wav(tokens[0])
+                    results.append(wav)
+                except RuntimeError as e:
+                    print(f"  Vocoder failed for item {i}: {e}")
+                    results.append(None)
+
+        return results
 
     def generate_long(
         self,
@@ -388,11 +446,12 @@ class ChatterboxMultilingualTTS:
         max_words: int = 60,
         token_repetition_threshold: int = 3,
         trim_buffer: int = 25,
+        batch_size: int = 1,
     ) -> torch.Tensor:
         """
         Generate speech from long text by splitting into sentences.
 
-        Each sentence is generated separately and concatenated with pauses.
+        Sentences are grouped into batches and generated in parallel on the GPU.
 
         Args:
             text: Input text (can be multiple sentences)
@@ -406,6 +465,9 @@ class ChatterboxMultilingualTTS:
             top_p: Top-p (nucleus) sampling parameter
             pause_duration: Silence between sentences in seconds
             max_words: Max words per chunk
+            token_repetition_threshold: Consecutive identical tokens to trigger forced EOS
+            trim_buffer: Frames to keep after text completion when trimming
+            batch_size: Number of chunks to generate in parallel (default: 1)
 
         Returns:
             Generated audio waveform (tensor of shape [1, samples])
@@ -429,41 +491,112 @@ class ChatterboxMultilingualTTS:
         # Prepare conditionals once
         if audio_prompt_path:
             self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+        else:
+            assert self.conds is not None, "Call prepare_conditionals first or provide audio_prompt_path"
+
+        # Update exaggeration if changed
+        if float(exaggeration) != float(self.conds.t3.emotion_adv[0, 0, 0].item()):
+            _cond = self.conds.t3
+            self.conds.t3 = T3Cond(
+                speaker_emb=_cond.speaker_emb,
+                cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
+                emotion_adv=exaggeration * torch.ones(1, 1, 1),
+            ).to(device=self.device)
 
         pause_samples = int(pause_duration * self.sr)
         pause = torch.zeros(1, pause_samples)
 
-        max_retries = 2
-        chunks = []
-        for i, sentence in enumerate(sentences):
-            print(f"Generating sentence {i + 1}/{len(sentences)}: {sentence[:60]}...")
-            wav = None
-            for attempt in range(1 + max_retries):
-                try:
-                    wav = self.generate(
-                        sentence, language_id,
-                        exaggeration=exaggeration, cfg_weight=cfg_weight,
-                        temperature=temperature, repetition_penalty=repetition_penalty,
-                        min_p=min_p, top_p=top_p,
-                        token_repetition_threshold=token_repetition_threshold,
-                        trim_buffer=trim_buffer,
-                    )
-                    # Retry only if forced EOS cut the sentence short (text not fully spoken)
-                    if self._last_forced_eos and not self._last_text_complete and attempt < max_retries:
-                        print(f"  Sentence cut short by forced EOS, retrying sentence {i + 1} (attempt {attempt + 2}/{1 + max_retries})...")
-                        continue
-                    break
-                except RuntimeError as e:
-                    if attempt < max_retries:
-                        print(f"  Error, retrying sentence {i + 1} (attempt {attempt + 2}/{1 + max_retries}): {e}")
-                        continue
-                    print(f"Warning: skipping sentence {i + 1} ({e})")
-                    break
+        gen_kwargs = dict(
+            language_id=language_id,
+            exaggeration=exaggeration, cfg_weight=cfg_weight,
+            temperature=temperature, repetition_penalty=repetition_penalty,
+            min_p=min_p, top_p=top_p,
+            token_repetition_threshold=token_repetition_threshold,
+            trim_buffer=trim_buffer,
+        )
 
-            if wav is not None:
-                chunks.append(wav)
-                if i < len(sentences) - 1:
+        # Sequential path (batch_size=1): use existing retry logic
+        if batch_size <= 1:
+            max_retries = 2
+            chunks = []
+            for i, sentence in enumerate(sentences):
+                print(f"Generating sentence {i + 1}/{len(sentences)}: {sentence[:60]}...")
+                wav = None
+                for attempt in range(1 + max_retries):
+                    try:
+                        wav = self.generate(sentence, **gen_kwargs)
+                        if self._last_forced_eos and not self._last_text_complete and attempt < max_retries:
+                            print(f"  Sentence cut short by forced EOS, retrying ({attempt + 2}/{1 + max_retries})...")
+                            continue
+                        break
+                    except RuntimeError as e:
+                        if attempt < max_retries:
+                            print(f"  Error, retrying ({attempt + 2}/{1 + max_retries}): {e}")
+                            continue
+                        print(f"Warning: skipping sentence {i + 1} ({e})")
+                        break
+
+                if wav is not None:
+                    chunks.append(wav)
+                    if i < len(sentences) - 1:
+                        chunks.append(pause)
+
+            if not chunks:
+                raise RuntimeError("Failed to generate any audio chunks")
+            return torch.cat(chunks, dim=1)
+
+        # Batched path
+        total = len(sentences)
+        results = [None] * total  # ordered waveforms
+        pending = list(range(total))  # indices still to generate
+        max_retries = 2
+        attempt = 0
+
+        while pending and attempt <= max_retries:
+            # Process pending sentences in batches, collect failures
+            failed = []
+            for batch_start in range(0, len(pending), batch_size):
+                batch_indices = pending[batch_start:batch_start + batch_size]
+                batch_texts = [sentences[idx] for idx in batch_indices]
+
+                label = f"batch {batch_start // batch_size + 1}"
+                if attempt > 0:
+                    label += f" (retry {attempt})"
+                items = ", ".join(str(idx + 1) for idx in batch_indices)
+                print(f"Generating {label} — sentences [{items}]...")
+
+                wavs = self.generate_batch(batch_texts, **gen_kwargs)
+
+                for j, idx in enumerate(batch_indices):
+                    forced = self._last_batch_forced_eos[j]
+                    complete = self._last_batch_text_complete[j]
+
+                    if wavs[j] is None:
+                        failed.append(idx)
+                    elif forced and not complete:
+                        print(f"  Sentence {idx + 1} cut short by forced EOS, will retry")
+                        failed.append(idx)
+                    else:
+                        results[idx] = wavs[j]
+
+            pending = failed
+            attempt += 1
+
+        # Skip any sentences that failed all retries
+        for idx in pending:
+            print(f"Warning: skipping sentence {idx + 1} after {max_retries} retries")
+
+        # Assemble final audio in order
+        chunks = []
+        for i in range(total):
+            if results[i] is not None:
+                chunks.append(results[i])
+                if i < total - 1:
                     chunks.append(pause)
+
+        # Remove trailing pause if last sentence was skipped
+        if chunks and chunks[-1].shape[1] == pause_samples:
+            chunks = chunks[:-1]
 
         if not chunks:
             raise RuntimeError("Failed to generate any audio chunks")

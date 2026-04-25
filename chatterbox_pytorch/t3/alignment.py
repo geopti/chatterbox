@@ -33,19 +33,21 @@ class AlignmentStreamAnalyzer:
     (stored by LLaMAAttention.forward()). No hooks needed.
     """
 
-    def __init__(self, backbone, text_tokens_slice, eos_idx, token_repetition_threshold=3, trim_buffer=25):
+    def __init__(self, backbone, text_tokens_slice, eos_idx, token_repetition_threshold=3, trim_buffer=25, batch_idx=0):
         """
         Args:
             backbone: LLaMABackbone instance (to read _last_attn_weights from layers)
             text_tokens_slice: Tuple (start, end) of text token positions in the sequence
             eos_idx: Token ID for end-of-speech (stop_speech_token)
             token_repetition_threshold: Number of consecutive identical tokens to trigger forced EOS (default: 3)
+            batch_idx: Index into the batch dimension for reading attention weights (default: 0)
         """
         self.backbone = backbone
         self.text_tokens_slice = (i, j) = text_tokens_slice
         self.eos_idx = eos_idx
         self.token_repetition_threshold = token_repetition_threshold
         self.trim_buffer = trim_buffer
+        self.batch_idx = batch_idx
 
         self.alignment = torch.zeros(0, j - i)
         self.curr_frame_pos = 0
@@ -66,7 +68,7 @@ class AlignmentStreamAnalyzer:
         attns = []
         for layer_idx, head_idx in LLAMA_ALIGNED_HEADS:
             attn = self.backbone.layers[layer_idx].attn._last_attn_weights
-            attns.append(attn[0, head_idx].cpu())  # (seq_len, kv_len)
+            attns.append(attn[self.batch_idx, head_idx].cpu())  # (seq_len, kv_len)
         return attns
 
     def step(self, logits, next_token=None):

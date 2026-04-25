@@ -401,6 +401,268 @@ class T3(nn.Module):
         return all_tokens
 
     @torch.inference_mode()
+    def inference_batch(
+        self,
+        t3_cond: T3Cond,
+        text_tokens_list: List[Tensor],
+        max_new_tokens: int = 1000,
+        temperature: float = 0.8,
+        top_p: float = 0.95,
+        min_p: float = 0.05,
+        repetition_penalty: float = 1.2,
+        cfg_weight: float = 0.5,
+        use_alignment_analyzer: bool = False,
+        token_repetition_threshold: int = 3,
+        trim_buffer: int = 25,
+    ) -> List[Tensor]:
+        """
+        Batched speech token generation for multiple text sequences in parallel.
+
+        Each text sequence is processed simultaneously on the GPU.
+        Uses left-padding so all sequences align at the right edge.
+
+        Args:
+            t3_cond: Conditioning data (shared across all sequences)
+            text_tokens_list: List of N text token tensors, each (2, text_len_i) for CFG
+            max_new_tokens: Maximum tokens to generate per sequence
+            temperature: Sampling temperature
+            top_p: Top-p sampling parameter
+            min_p: Min-p sampling parameter
+            repetition_penalty: Repetition penalty factor
+            cfg_weight: Classifier-free guidance weight
+            use_alignment_analyzer: Enable hallucination detection
+            token_repetition_threshold: Consecutive identical tokens to trigger forced EOS
+            trim_buffer: Frames to keep after text completion when trimming
+
+        Returns:
+            List of N generated speech token tensors
+        """
+        N = len(text_tokens_list)
+        device = self.device
+
+        sos_token = torch.tensor(
+            [[self.config.start_speech_token]], device=device, dtype=torch.long
+        )
+
+        # 1. Prepare embeddings for each sequence (with CFG doubling)
+        all_embeds = []
+        all_cond_lens = []
+        all_text_lens = []
+        for text_tokens in text_tokens_list:
+            text_tokens = torch.atleast_2d(text_tokens).to(device)
+            batch_size_i = text_tokens.shape[0]  # 2 for CFG
+            sos_i = sos_token.expand(batch_size_i, -1)
+
+            embeds, cond_len = self.prepare_input_embeds(
+                t3_cond=t3_cond,
+                text_tokens=text_tokens,
+                speech_tokens=sos_i,
+                cfg_weight=cfg_weight,
+            )
+
+            # Add BOS embed
+            bos_token_single = torch.tensor(
+                [[self.config.start_speech_token]], device=device, dtype=torch.long
+            )
+            bos_embed = self.speech_emb(bos_token_single)
+            if self.speech_pos_emb is not None:
+                bos_embed = bos_embed + self.speech_pos_emb.get_fixed_embedding(0)
+            if batch_size_i > 1:
+                bos_embed = bos_embed.expand(batch_size_i, -1, -1)
+
+            embeds = torch.cat([embeds, bos_embed], dim=1)  # (2, real_len, hidden)
+            all_embeds.append(embeds)
+            all_cond_lens.append(cond_len)
+            all_text_lens.append(text_tokens.shape[1])
+
+        # 2. Left-pad and stack into a single batch
+        real_lens = [e.shape[1] for e in all_embeds]
+        max_len = max(real_lens)
+        pad_lens = [max_len - rl for rl in real_lens]
+        hidden_dim = all_embeds[0].shape[2]
+
+        padded = []
+        for embeds, pad_len in zip(all_embeds, pad_lens):
+            if pad_len > 0:
+                pad = torch.zeros(embeds.shape[0], pad_len, hidden_dim, device=device)
+                embeds = torch.cat([pad, embeds], dim=1)
+            padded.append(embeds)
+
+        # (2*N, max_len, hidden) — interleaved [cond_0, uncond_0, cond_1, uncond_1, ...]
+        inputs_embeds = torch.cat(padded, dim=0)
+        total_batch = inputs_embeds.shape[0]  # 2*N
+
+        # 3. Create attention mask (causal + padding)
+        causal_mask = torch.triu(
+            torch.full((max_len, max_len), float("-inf"), device=device),
+            diagonal=1,
+        )
+        padding_mask = torch.zeros(total_batch, 1, 1, max_len, device=device)
+        for i in range(N):
+            pl = pad_lens[i]
+            if pl > 0:
+                padding_mask[2 * i, :, :, :pl] = float("-inf")
+                padding_mask[2 * i + 1, :, :, :pl] = float("-inf")
+        attention_mask = causal_mask.unsqueeze(0).unsqueeze(0) + padding_mask
+
+        # Fix: allow padding positions to self-attend to avoid NaN from softmax(all -inf).
+        # Without this, padding query positions have ALL -inf attention weights (causal blocks
+        # future, padding mask blocks all padding keys), so softmax produces NaN which
+        # propagates through the KV-cache and corrupts real positions.
+        # Self-attending on zero embeddings: softmax(0)*0 = 0, keeping outputs clean.
+        for i in range(N):
+            pl = pad_lens[i]
+            if pl > 0:
+                diag_idx = torch.arange(pl, device=device)
+                attention_mask[2 * i, 0, diag_idx, diag_idx] = 0.0
+                attention_mask[2 * i + 1, 0, diag_idx, diag_idx] = 0.0
+
+        # 4. Position IDs (per-sequence, accounting for left-padding)
+        position_ids = torch.zeros(total_batch, max_len, device=device, dtype=torch.long)
+        for i in range(N):
+            pl = pad_lens[i]
+            rl = real_lens[i]
+            pos = torch.arange(rl, device=device)
+            position_ids[2 * i, pl:] = pos
+            position_ids[2 * i + 1, pl:] = pos
+
+        # 5. Initial forward pass
+        hidden_states, past_key_values = self.backbone(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=True,
+        )
+
+        # 6. Create alignment analyzers (one per sequence)
+        analyzers = [None] * N
+        if use_alignment_analyzer:
+            from .alignment import AlignmentStreamAnalyzer
+            for i in range(N):
+                pl = pad_lens[i]
+                text_start = pl + all_cond_lens[i]
+                text_end = text_start + all_text_lens[i]
+                analyzers[i] = AlignmentStreamAnalyzer(
+                    self.backbone,
+                    text_tokens_slice=(text_start, text_end),
+                    eos_idx=self.config.stop_speech_token,
+                    token_repetition_threshold=token_repetition_threshold,
+                    trim_buffer=trim_buffer,
+                    batch_idx=2 * i,  # conditioned batch element
+                )
+
+        # 7. Precompute padding mask for generation steps (padding positions are fixed)
+        max_kv_len = max_len + max_new_tokens + 1
+        full_pad_mask = torch.zeros(total_batch, 1, 1, max_kv_len, device=device)
+        for i in range(N):
+            pl = pad_lens[i]
+            if pl > 0:
+                full_pad_mask[2 * i, :, :, :pl] = float("-inf")
+                full_pad_mask[2 * i + 1, :, :, :pl] = float("-inf")
+
+        # Next position ID per batch element
+        next_pos = torch.tensor(
+            [real_lens[i // 2] for i in range(total_batch)],
+            device=device, dtype=torch.long,
+        )
+
+        # Per-sequence generated tokens and state
+        generated = [[sos_token.clone()] for _ in range(N)]
+        finished = [False] * N
+
+        # 8. Generation loop
+        for step in tqdm(range(max_new_tokens), desc="Generating"):
+            logits = self.speech_head(hidden_states[:, -1:, :]).squeeze(1)  # (2*N, vocab)
+
+            # Per-sequence: apply CFG, analyzer, process logits, sample
+            next_tokens_batch = []
+            for i in range(N):
+                if finished[i]:
+                    tok = torch.tensor(
+                        [[self.config.stop_speech_token]], device=device, dtype=torch.long
+                    )
+                    next_tokens_batch.append(tok)
+                    continue
+
+                # CFG
+                cond_logits = logits[2 * i: 2 * i + 1]
+                uncond_logits = logits[2 * i + 1: 2 * i + 2]
+                seq_logits = cond_logits + cfg_weight * (cond_logits - uncond_logits)
+
+                # Alignment analysis
+                if analyzers[i] is not None:
+                    last_tok = generated[i][-1].item()
+                    seq_logits = analyzers[i].step(seq_logits, next_token=last_tok)
+
+                # Process logits
+                input_ids = torch.cat(generated[i], dim=1)
+                seq_logits = process_logits(
+                    seq_logits, input_ids=input_ids,
+                    temperature=temperature, top_p=top_p,
+                    min_p=min_p, repetition_penalty=repetition_penalty,
+                )
+
+                # Sample
+                tok = sample_token(seq_logits, do_sample=True)
+                generated[i].append(tok)
+
+                if tok.item() == self.config.stop_speech_token:
+                    finished[i] = True
+
+                next_tokens_batch.append(tok)
+
+            if all(finished):
+                break
+
+            # Build next input embeddings for all batch elements (cond + uncond pairs)
+            token_list = []
+            for i in range(N):
+                tok = next_tokens_batch[i]
+                token_list.extend([tok, tok])  # cond and uncond get same token
+            next_tokens = torch.cat(token_list, dim=0)  # (2*N, 1)
+
+            next_emb = self.speech_emb(next_tokens)
+            if self.speech_pos_emb is not None:
+                next_emb = next_emb + self.speech_pos_emb.get_fixed_embedding(step + 1)
+
+            # Position IDs and attention mask for this step
+            step_pos = (next_pos + step).unsqueeze(1)  # (2*N, 1)
+            kv_len = max_len + step + 1
+            step_mask = full_pad_mask[:, :, :, :kv_len]
+
+            hidden_states, past_key_values = self.backbone(
+                inputs_embeds=next_emb,
+                attention_mask=step_mask,
+                position_ids=step_pos,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+
+        # 9. Collect results
+        results = []
+        self._last_batch_forced_eos = []
+        self._last_batch_text_complete = []
+        for i in range(N):
+            tokens = torch.cat(generated[i], dim=1)
+
+            # Trim garbage tail
+            if analyzers[i] is not None and analyzers[i].trim_to is not None:
+                trim_len = analyzers[i].trim_to + 1
+                if trim_len < tokens.shape[1]:
+                    logger.info(f"Trimming seq {i} from {tokens.shape[1]} to {trim_len}")
+                    tokens = tokens[:, :trim_len]
+
+            results.append(tokens)
+            self._last_batch_forced_eos.append(
+                analyzers[i].forced_eos if analyzers[i] else False
+            )
+            self._last_batch_text_complete.append(
+                analyzers[i].complete if analyzers[i] else True
+            )
+
+        return results
+
+    @torch.inference_mode()
     def inference_turbo(
         self,
         t3_cond: T3Cond,

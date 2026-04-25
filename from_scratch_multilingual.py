@@ -56,6 +56,8 @@ def main():
                         help="Consecutive identical tokens to trigger forced EOS (default: 3)")
     parser.add_argument("--trim-buffer", type=int, default=25,
                         help="Frames to keep after text completion when trimming garbage tail (default: 25, ~1s)")
+    parser.add_argument("--batch-size", type=int, default=1,
+                        help="Number of chunks to generate in parallel when using --long (default: 1)")
 
     args = parser.parse_args()
 
@@ -112,6 +114,7 @@ def main():
     if args.long:
         gen_kwargs["pause_duration"] = args.pause
         gen_kwargs["max_words"] = args.max_words
+        gen_kwargs["batch_size"] = args.batch_size
 
     print("Generating speech..." + (" (long mode)" if args.long else ""))
     wav = gen_func(args.text, **gen_kwargs)
